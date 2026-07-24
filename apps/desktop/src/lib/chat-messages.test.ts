@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { ChatMessage, ChatMessagePart } from './chat-messages'
+import type { SessionMessage } from '@/types/hermes'
 import {
   appendAssistantTextPart,
   appendReasoningPart,
@@ -988,5 +989,138 @@ describe('collectUnspokenTurnSpeech', () => {
     expect(collectUnspokenTurnSpeech([], null)).toBeNull()
     expect(collectUnspokenTurnSpeech([assistant('a1', 'Done.')], 'a1')).toBeNull()
     expect(collectUnspokenTurnSpeech([user('u1', 'hello'), assistant('a1', '')], null)).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// display_metadata normalisation (regression suite for the Resume Failed bug)
+// ---------------------------------------------------------------------------
+
+describe('display_metadata normalisation', () => {
+  // Helper: a minimal SessionMessage with only the fields toChatMessages reads.
+  // NOTE: display_metadata is deliberately typed as `unknown` on the overrides
+  // parameter because these regression tests exercise the runtime reality where
+  // SQLite TEXT arrives as a JSON string, null, or malformed payload — all of
+  // which are outside the nominal TypeScript union type. The `as` cast at the
+  // call site is the cost of testing the boundary that the type system cannot
+  // express.
+  const msg = (overrides: {
+    content?: unknown
+    display_kind?: SessionMessage['display_kind']
+    display_metadata?: unknown
+    role?: SessionMessage['role']
+    timestamp?: number
+  } = {}): SessionMessage => ({
+    content: overrides.content ?? 'content',
+    display_kind: overrides.display_kind ?? 'async_delegation_complete',
+    display_metadata: overrides.display_metadata as SessionMessage['display_metadata'],
+    role: overrides.role ?? 'user',
+    timestamp: overrides.timestamp ?? 1
+  })
+
+  const lastText = (chatMessages: ChatMessage[]) =>
+    chatMessages.length > 0
+      ? chatMessageText(chatMessages[chatMessages.length - 1])
+      : ''
+
+  it('A — object metadata: reads task_count correctly', () => {
+    const messages = toChatMessages([
+      msg({ display_metadata: { task_count: 3, delegation_id: 'd1' } })
+    ])
+
+    expect(lastText(messages)).toBe('3 background agents finished')
+  })
+
+  it('B — JSON string metadata: hydrates and reads task_count', () => {
+    const messages = toChatMessages([
+      msg({ display_metadata: JSON.stringify({ task_count: 2, delegation_id: 'd2' }) })
+    ])
+
+    expect(lastText(messages)).toBe('2 background agents finished')
+  })
+
+  it('C — null / undefined: fallback text, no crash', () => {
+    expect(lastText(toChatMessages([msg({ display_metadata: null })]))).toBe(
+      'background agent work finished'
+    )
+    expect(lastText(toChatMessages([msg({ display_metadata: undefined })]))).toBe(
+      'background agent work finished'
+    )
+  })
+
+  it('D — empty string: fallback text, no crash', () => {
+    expect(lastText(toChatMessages([msg({ display_metadata: '' })]))).toBe(
+      'background agent work finished'
+    )
+  })
+
+  it('E — malformed JSON: fallback text, no crash', () => {
+    expect(lastText(toChatMessages([msg({ display_metadata: '{broken' })]))).toBe(
+      'background agent work finished'
+    )
+  })
+
+  it('F — JSON parses to primitive (number): fallback, no crash', () => {
+    expect(lastText(toChatMessages([msg({ display_metadata: '42' })]))).toBe(
+      'background agent work finished'
+    )
+  })
+
+  it('G — JSON parses to array: fallback, no crash', () => {
+    expect(lastText(toChatMessages([msg({ display_metadata: '[1,2,3]' })]))).toBe(
+      'background agent work finished'
+    )
+  })
+
+  it('H — object missing task_count: fallback, no crash', () => {
+    expect(
+      lastText(toChatMessages([msg({ display_metadata: { delegation_id: 'd3' } })]))
+    ).toBe('background agent work finished')
+  })
+
+  it('I — async_delegation_complete with task_count=0: shows "0 background agents finished"', () => {
+    // 0 is falsy but a valid count — the guard uses typeof === 'number', not truthiness.
+    expect(
+      lastText(
+        toChatMessages([msg({ display_metadata: { task_count: 0, delegation_id: 'd4' } })])
+      )
+    ).toBe('0 background agents finished')
+  })
+
+  it('J — session with many messages: one bad metadata does not break the whole session', () => {
+    const messages = toChatMessages([
+      msg({ content: 'first', display_kind: undefined, display_metadata: undefined }),
+      msg({ display_metadata: '{broken' }), // malformed → falls back
+      msg({ display_metadata: { task_count: 1, delegation_id: 'd5' } }) // good
+    ])
+
+    expect(messages).toHaveLength(3)
+    expect(lastText(messages)).toBe('1 background agent finished')
+  })
+
+  it('K — model_switch kind with string metadata: does not crash', () => {
+    const messages = toChatMessages([
+      msg({
+        display_kind: 'model_switch',
+        display_metadata: JSON.stringify({ model: 'gpt-5', provider: 'openai' })
+      })
+    ])
+
+    expect(lastText(messages)).toBe('model changed')
+  })
+
+  it('L — historical TEXT record (real bug fixture): no crash', () => {
+    // Exact shape from the production session that triggered the bug.
+    const fixture = JSON.stringify({
+      delegation_id: 'deleg_9b840674',
+      task_count: 1,
+      completed_count: 1,
+      failed_count: 0,
+      duration_seconds: 200.65
+    })
+
+    const messages = toChatMessages([msg({ display_metadata: fixture })])
+
+    expect(lastText(messages)).toBe('1 background agent finished')
   })
 })

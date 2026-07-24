@@ -311,15 +311,66 @@ function transcriptContent(displayKind: SessionMessage['display_kind'], content:
   return displayKind === 'hidden' ? null : content
 }
 
+/**
+ * Normalize `display_metadata` from its on-disk / API form into a plain object.
+ *
+ * SQLite stores `display_metadata` as TEXT (JSON string).  The Python API
+ * returns it as a JSON-encoded string inside the JSON response, so the
+ * deserialised `SessionMessage.display_metadata` is a *string* at runtime,
+ * even though the TypeScript type declares `TimelineDisplayMetadata` (an
+ * object union).  Every consumer must go through this helper so they receive
+ * a real object — never a raw string.
+ *
+ * Normalisation rules (Layer A — hydration boundary):
+ *  - already an object (not array) → returned as-is
+ *  - non-empty string → `JSON.parse`; result must be a non-array object
+ *  - `null` / `undefined` / empty string / malformed JSON / parse→primitive /
+ *    parse→array → `undefined`
+ *
+ * This is intentionally strict: a metadata blob that isn't a plain object is
+ * indistinguishable from absent metadata for display purposes, and silently
+ * swallowing a parse error is safer than crashing the entire session resume.
+ */
+function normalizeDisplayMetadata(
+  raw: unknown
+): Record<string, unknown> | undefined {
+  if (raw === null || raw === undefined) {
+    return undefined
+  }
+
+  if (typeof raw === 'object' && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>
+  }
+
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return undefined
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(raw)
+
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return undefined
+    }
+
+    return parsed as Record<string, unknown>
+  } catch {
+    return undefined
+  }
+}
+
 function timelineDisplayContent(message: SessionMessage, content: string): string {
   if (message.display_kind === 'model_switch') {
     return 'model changed'
   }
 
   if (message.display_kind === 'async_delegation_complete') {
+    // Layer B — defensive renderer guard: never trust the TypeScript type
+    // alone; display_metadata can arrive as a JSON string from the API.
+    const meta = normalizeDisplayMetadata(message.display_metadata)
     const count =
-      message.display_metadata && 'task_count' in message.display_metadata
-        ? message.display_metadata.task_count
+      meta !== undefined && 'task_count' in meta && typeof meta.task_count === 'number'
+        ? meta.task_count
         : undefined
 
     return count === undefined
@@ -843,6 +894,16 @@ function withUniqueToolCallIds(messages: ChatMessage[]): ChatMessage[] {
 }
 
 export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
+  // Layer A — hydration boundary: normalise display_metadata from its
+  // on-disk TEXT form (JSON string) into a real object so every downstream
+  // consumer (timelineDisplayContent, model_switch rendering, etc.) receives
+  // a parsed value and never a raw string that would crash `'…' in …`.
+  const hydrated = messages.map(message => {
+    const meta = normalizeDisplayMetadata(message.display_metadata)
+
+    return meta === message.display_metadata ? message : { ...message, display_metadata: meta }
+  }) as SessionMessage[]
+
   const result: ChatMessage[] = []
   let pendingToolParts: ChatMessagePart[] = []
   let pendingToolTimestamp: number | undefined
@@ -890,7 +951,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     clearPendingTools()
   }
 
-  messages.forEach((message, index) => {
+  hydrated.forEach((message, index) => {
     if (message.role === 'tool') {
       const updatedPendingToolParts = applyStoredToolResultToParts(pendingToolParts, message)
 
