@@ -206,10 +206,25 @@ class UpdateLock:
         orchestrating parent (the Tauri updater spawning `hermes update` as a
         stage): we run under ITS claim rather than refusing or re-writing the
         marker, and ``release`` leaves the parent's marker untouched.
+
+        When HANDOFF_PID_ENV is not set — the parent updater predates the
+        handoff mechanism (a Tauri ``hermes-setup`` binary that hasn't been
+        rebuilt yet) — fall back to :func:`os.getppid`: a live holder owned
+        by our direct parent means we were intentionally spawned under that
+        parent's lock. The fallback is ONLY active when the env-var handoff
+        did not fire, so it cannot weaken the guard for a forged value.
         """
         existing = read_live_update(path=self.path)
         if existing is not None:
-            if existing.pid == _handoff_pid():
+            handoff_pid = _handoff_pid()
+            if existing.pid == handoff_pid:
+                return True
+            # Parent-pid fallback for older updater binaries that don't set
+            # the handoff env var. The parent holds the marker for its whole
+            # run; a child spawned under it must be allowed to proceed. Only
+            # fires when the env-var path returned None — a forged/empty env
+            # cannot downgrade the guard to the weaker parent check.
+            if handoff_pid is None and existing.pid == os.getppid():
                 return True
             self.holder = existing
             return False

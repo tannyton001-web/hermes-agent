@@ -224,3 +224,70 @@ class TestHandoffFromOrchestratingUpdater:
         assert lock.acquire() is True
         assert lock.acquired is True
         assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()
+
+
+class TestParentPidFallback:
+    """When the orchestrating updater predates the handoff mechanism.
+
+    An older Tauri ``hermes-setup`` binary holds the marker but does NOT
+    set ``HERMES_UPDATE_HANDOFF_PID`` on the child. The child must still be
+    allowed to proceed under the parent's lock. The fallback uses
+    ``os.getppid()``: the marker owner being our direct parent means we
+    were intentionally spawned under that lock.
+
+    The fallback is ONLY active when the env-var handoff returned None
+    (the env var is absent or empty). A forged/empty env cannot downgrade
+    the guard to the weaker parent check.
+    """
+
+    def test_parent_pid_fallback_allows_child_without_handoff_env(self, marker, monkeypatch):
+        """A live marker owned by our parent, no HANDOFF env → allow."""
+        # Write the marker as if our parent (getppid) owns it.
+        parent_pid = os.getppid()
+        marker.write_text(f"{parent_pid}\n{int(time.time())}\n", encoding="utf-8")
+        # Ensure HANDOFF_PID_ENV is NOT set.
+        monkeypatch.delenv(HANDOFF_PID_ENV, raising=False)
+
+        lock = UpdateLock(path=marker)
+        assert lock.acquire() is True
+        assert lock.acquired is False, "running under the parent's claim, not our own"
+
+        lock.release()
+        assert marker.exists(), "the parent still needs its marker after our stage"
+        assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == parent_pid
+
+    def test_parent_pid_fallback_refuses_non_parent_owner(self, marker, monkeypatch):
+        """The marker owner is alive but NOT our parent → still refuse."""
+        marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
+        monkeypatch.delenv(HANDOFF_PID_ENV, raising=False)
+
+        # The marker owner (os.getpid) is our own PID, NOT our parent's.
+        # This simulates a truly foreign updater.
+        lock = UpdateLock(path=marker)
+        assert lock.acquire() is False
+        assert lock.holder is not None
+
+    def test_handoff_env_prevents_parent_pid_fallback(self, marker, monkeypatch):
+        """When HANDOFF_PID_ENV is set (even to a wrong value), the parent-pid
+        fallback must NOT activate — the env-var handoff is the only gate,
+        and a wrong value there means a real refusal."""
+        parent_pid = os.getppid()
+        marker.write_text(f"{parent_pid}\n{int(time.time())}\n", encoding="utf-8")
+        # Set HANDOFF_PID_ENV to a DIFFERENT pid than the marker owner.
+        # The env-var handoff check fails (wrong pid), and the parent-pid
+        # fallback must NOT activate because handoff_pid is NOT None.
+        monkeypatch.setenv(HANDOFF_PID_ENV, str(parent_pid + 1))
+
+        lock = UpdateLock(path=marker)
+        assert lock.acquire() is False
+        assert lock.holder is not None
+
+    def test_empty_handoff_env_does_not_block_parent_pid_fallback(self, marker, monkeypatch):
+        """An empty HANDOFF_PID_ENV counts as absent (handoff_pid returns None)."""
+        parent_pid = os.getppid()
+        marker.write_text(f"{parent_pid}\n{int(time.time())}\n", encoding="utf-8")
+        monkeypatch.setenv(HANDOFF_PID_ENV, "")
+
+        lock = UpdateLock(path=marker)
+        assert lock.acquire() is True
+        assert lock.acquired is False
