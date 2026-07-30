@@ -25,7 +25,8 @@ jobs:
           set -euo pipefail
 
           echo "TRIGGER_EVENT=${{ github.event_name }}"
-          echo "LOCAL_MAIN_SHA=$(git rev-parse --short HEAD)"
+          LOCAL_SHA=$(git rev-parse --short HEAD)
+          echo "LOCAL_MAIN_SHA=$LOCAL_SHA"
 
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
 
@@ -34,52 +35,71 @@ jobs:
           for i in 1 2 3; do
             attempts="$i"
             echo "::group::Fetch attempt $i"
-            git fetch --prune upstream main
-            rc=$?
-            echo "::endgroup::"
-            if [ "$rc" -eq 0 ]; then
+            if git fetch --prune upstream main; then
               fetch_ok=1
+              echo "::endgroup::"
               break
+            else
+              rc=$?
+              echo "::endgroup::"
+              echo "Attempt $i failed (exit=$rc)"
             fi
-            echo "Attempt $i failed (exit=$rc), retrying in 15s..."
-            sleep 15
+            if [ "$i" -lt 3 ]; then
+              sleep 15
+            fi
           done
 
           echo "FETCH_ATTEMPTS=$attempts"
-          echo "FETCH_OK=$fetch_ok"
-
           if [ "$fetch_ok" -ne 1 ]; then
+            echo "FETCH_STATUS=FAIL"
             echo "FATAL: upstream fetch failed after $attempts attempts"
             exit 1
           fi
+          echo "FETCH_STATUS=PASS"
 
           UPSTREAM_SHA=$(git rev-parse --short upstream/main)
           echo "UPSTREAM_MAIN_SHA=$UPSTREAM_SHA"
 
           BEHIND=$(git rev-list --count HEAD..upstream/main)
+          AHEAD=$(git rev-list --count upstream/main..HEAD)
           echo "BEHIND_COUNT=$BEHIND"
+          echo "AHEAD_COUNT=$AHEAD"
+
+          if [ "$AHEAD" -gt 0 ]; then
+            echo "MERGE_ACTION=REVIEW_DIVERGED"
+            echo "FATAL: fork main is $AHEAD commits ahead of upstream — not an exact mirror"
+            exit 1
+          fi
 
           if [ "$BEHIND" -eq 0 ]; then
             echo "MERGE_ACTION=NO_ACTION"
-            echo "Already up to date."
-            exit 0
+          else
+            git merge upstream/main --ff-only
+            echo "MERGE_ACTION=FAST_FORWARD"
+            echo "Synced $BEHIND commits"
+            git push origin main
+            echo "PUSH_ACTION=pushed"
           fi
 
-          git merge upstream/main --ff-only
-          echo "MERGE_ACTION=FAST_FORWARD"
-          echo "Synced $BEHIND commits"
-
-          git push origin main
-          echo "PUSH_ACTION=pushed"
-
           git fetch origin main
+          LOCAL_SHA=$(git rev-parse --short HEAD)
+          UPSTREAM_SHA=$(git rev-parse --short upstream/main)
           ORIGIN_SHA=$(git rev-parse --short origin/main)
           echo "ORIGIN_MAIN_SHA_AFTER_PUSH=$ORIGIN_SHA"
 
-          if [ "$ORIGIN_SHA" = "$UPSTREAM_SHA" ]; then
+          MIRROR_OK=1
+          if [ "$LOCAL_SHA" != "$UPSTREAM_SHA" ]; then
+            echo "LOCAL_MISMATCH: local=$LOCAL_SHA upstream=$UPSTREAM_SHA"
+            MIRROR_OK=0
+          fi
+          if [ "$ORIGIN_SHA" != "$UPSTREAM_SHA" ]; then
+            echo "ORIGIN_MISMATCH: origin=$ORIGIN_SHA upstream=$UPSTREAM_SHA"
+            MIRROR_OK=0
+          fi
+
+          if [ "$MIRROR_OK" -eq 1 ]; then
             echo "EXACT_MIRROR_STATUS=PASS"
           else
             echo "EXACT_MIRROR_STATUS=FAIL"
-            echo "FATAL: origin/main ($ORIGIN_SHA) != upstream/main ($UPSTREAM_SHA)"
             exit 1
           fi
