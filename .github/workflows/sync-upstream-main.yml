@@ -1,0 +1,54 @@
+name: Sync Fork Main with Upstream
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: github.repository == 'tannyton001-web/hermes-agent'
+    steps:
+      - name: Checkout fork main (exact mirror target)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream (public repo — no auth needed)
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+          echo "UPSTREAM_SHA=$(git rev-parse upstream/main)" >> $GITHUB_ENV
+
+      - name: Fast-forward if behind
+        id: sync
+        run: |
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "status=NO_ACTION" >> $GITHUB_OUTPUT
+            echo "Already up to date."
+          else
+            git merge upstream/main --ff-only
+            echo "status=SYNCED" >> $GITHUB_OUTPUT
+            echo "Fast-forwarded $BEHIND commits."
+          fi
+
+      - name: Push to fork
+        if: steps.sync.outputs.status == 'SYNCED'
+        run: git push origin main
+
+      - name: Report
+        run: |
+          echo "STATUS=${{ steps.sync.outputs.status }}"
+          echo "FORK_MAIN=$(git rev-parse HEAD)"
+          echo "UPSTREAM_MAIN=${{ env.UPSTREAM_SHA }}"
