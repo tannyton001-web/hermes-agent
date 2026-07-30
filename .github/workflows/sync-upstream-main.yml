@@ -19,36 +19,74 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Fetch upstream (with retry)
+      - name: Fetch upstream with retry
+        id: fetch
         run: |
+          echo "TRIGGER_EVENT=${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "CHECKOUT_BRANCH=main" >> $GITHUB_STEP_SUMMARY
+          echo "LOCAL_MAIN_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_STEP_SUMMARY
+
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          FETCH_OK=0
           for i in 1 2 3; do
+            echo "::group::Fetch attempt $i"
             if git fetch upstream main 2>&1; then
-              echo "FETCH_OK=1" >> $GITHUB_ENV
+              FETCH_OK=1
+              echo "::endgroup::"
               break
             fi
-            echo "Fetch attempt $i failed, retrying in 10s..."
-            sleep 10
+            echo "::endgroup::"
+            echo "Attempt $i failed, retrying in 15s..."
+            sleep 15
           done
-          if [ "${FETCH_OK}" != "1" ]; then
-            echo "FATAL: Could not fetch upstream after 3 attempts"
+
+          echo "FETCH_ATTEMPTS=$i" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$FETCH_OK" -ne 1 ]; then
+            echo "FATAL: upstream fetch failed after $i attempts"
             exit 1
           fi
-          echo "UPSTREAM_SHA=$(git rev-parse upstream/main)" >> $GITHUB_ENV
 
-      - name: Sync if behind
-        id: sync
-        run: |
+          UPSTREAM_SHA=$(git rev-parse --short upstream/main)
+          echo "UPSTREAM_MAIN_SHA=$UPSTREAM_SHA" >> $GITHUB_STEP_SUMMARY
+
           BEHIND=$(git rev-list --count HEAD..upstream/main)
-          echo "Behind: $BEHIND commits"
+          echo "BEHIND_COUNT=$BEHIND" >> $GITHUB_STEP_SUMMARY
+
           if [ "$BEHIND" -eq 0 ]; then
+            echo "MERGE_ACTION=NO_ACTION" >> $GITHUB_STEP_SUMMARY
             echo "status=NO_ACTION" >> $GITHUB_OUTPUT
           else
-            git merge upstream/main --ff-only
-            echo "status=SYNCED" >> $GITHUB_OUTPUT
-            echo "Synced $BEHIND commits → $(git rev-parse --short HEAD)"
+            if git merge upstream/main --ff-only; then
+              echo "MERGE_ACTION=FAST_FORWARD" >> $GITHUB_STEP_SUMMARY
+              echo "status=SYNCED" >> $GITHUB_OUTPUT
+              echo "Synced $BEHIND commits → $(git rev-parse --short HEAD)"
+            else
+              echo "MERGE_ACTION=FAILED" >> $GITHUB_STEP_SUMMARY
+              echo "FATAL: cannot fast-forward — fork main diverged from upstream"
+              exit 1
+            fi
           fi
 
       - name: Push to fork
-        if: steps.sync.outputs.status == 'SYNCED'
-        run: git push origin main
+        if: steps.fetch.outputs.status == 'SYNCED'
+        id: push
+        run: |
+          echo "PUSH_ACTION=push origin main" >> $GITHUB_STEP_SUMMARY
+          git push origin main
+
+      - name: Verify exact mirror
+        if: steps.fetch.outputs.status == 'SYNCED'
+        run: |
+          git fetch origin main
+          ORIGIN_SHA=$(git rev-parse --short origin/main)
+          UPSTREAM_SHA=$(git rev-parse --short upstream/main)
+          echo "ORIGIN_MAIN_SHA_AFTER_PUSH=$ORIGIN_SHA" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$ORIGIN_SHA" = "$UPSTREAM_SHA" ]; then
+            echo "EXACT_MIRROR_STATUS=PASS" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "EXACT_MIRROR_STATUS=FAIL" >> $GITHUB_STEP_SUMMARY
+            echo "FATAL: origin/main ($ORIGIN_SHA) != upstream/main ($UPSTREAM_SHA)"
+            exit 1
+          fi
