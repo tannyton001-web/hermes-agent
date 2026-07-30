@@ -18,30 +18,37 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          persist-credentials: true
 
-      - name: Configure git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Fetch upstream
+      - name: Fetch upstream (with retry)
         run: |
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
-          git fetch upstream main
+          for i in 1 2 3; do
+            if git fetch upstream main 2>&1; then
+              echo "FETCH_OK=1" >> $GITHUB_ENV
+              break
+            fi
+            echo "Fetch attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          if [ "${FETCH_OK}" != "1" ]; then
+            echo "FATAL: Could not fetch upstream after 3 attempts"
+            exit 1
+          fi
+          echo "UPSTREAM_SHA=$(git rev-parse upstream/main)" >> $GITHUB_ENV
 
       - name: Sync if behind
         id: sync
         run: |
           BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "Behind: $BEHIND commits"
           if [ "$BEHIND" -eq 0 ]; then
             echo "status=NO_ACTION" >> $GITHUB_OUTPUT
           else
             git merge upstream/main --ff-only
             echo "status=SYNCED" >> $GITHUB_OUTPUT
+            echo "Synced $BEHIND commits → $(git rev-parse --short HEAD)"
           fi
 
-      - name: Push to fork (skip CI on sync commits)
+      - name: Push to fork
         if: steps.sync.outputs.status == 'SYNCED'
-        run: |
-          git push origin main
+        run: git push origin main
