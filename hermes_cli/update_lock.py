@@ -218,6 +218,10 @@ class UpdateLock:
         if existing is not None:
             handoff_pid = _handoff_pid()
             if existing.pid == handoff_pid:
+                logger.debug(
+                    "Update running under parent PID %s lock (HANDOFF_PID_ENV).",
+                    existing.pid,
+                )
                 return True
             # Parent-pid fallback for older updater binaries that don't set
             # the handoff env var. The parent holds the marker for its whole
@@ -225,6 +229,13 @@ class UpdateLock:
             # fires when the env-var path returned None — a forged/empty env
             # cannot downgrade the guard to the weaker parent check.
             if handoff_pid is None and existing.pid == os.getppid():
+                logger.info(
+                    "Update running under parent PID %s lock (getppid fallback — "
+                    "the staged hermes-setup binary predates the handoff "
+                    "mechanism). The update will proceed normally. To upgrade the "
+                    "staged updater binary, re-run the Hermes installer.",
+                    existing.pid,
+                )
                 return True
             self.holder = existing
             return False
