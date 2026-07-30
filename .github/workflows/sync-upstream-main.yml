@@ -19,74 +19,67 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Fetch upstream with retry
-        id: fetch
+      - name: Fetch upstream and sync
+        shell: bash
         run: |
-          echo "TRIGGER_EVENT=${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "CHECKOUT_BRANCH=main" >> $GITHUB_STEP_SUMMARY
-          echo "LOCAL_MAIN_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+
+          echo "TRIGGER_EVENT=${{ github.event_name }}"
+          echo "LOCAL_MAIN_SHA=$(git rev-parse --short HEAD)"
 
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
-          FETCH_OK=0
+
+          fetch_ok=0
+          attempts=0
           for i in 1 2 3; do
+            attempts="$i"
             echo "::group::Fetch attempt $i"
-            if git fetch upstream main 2>&1; then
-              FETCH_OK=1
-              echo "::endgroup::"
+            git fetch --prune upstream main
+            rc=$?
+            echo "::endgroup::"
+            if [ "$rc" -eq 0 ]; then
+              fetch_ok=1
               break
             fi
-            echo "::endgroup::"
-            echo "Attempt $i failed, retrying in 15s..."
+            echo "Attempt $i failed (exit=$rc), retrying in 15s..."
             sleep 15
           done
 
-          echo "FETCH_ATTEMPTS=$i" >> $GITHUB_STEP_SUMMARY
+          echo "FETCH_ATTEMPTS=$attempts"
+          echo "FETCH_OK=$fetch_ok"
 
-          if [ "$FETCH_OK" -ne 1 ]; then
-            echo "FATAL: upstream fetch failed after $i attempts"
+          if [ "$fetch_ok" -ne 1 ]; then
+            echo "FATAL: upstream fetch failed after $attempts attempts"
             exit 1
           fi
 
           UPSTREAM_SHA=$(git rev-parse --short upstream/main)
-          echo "UPSTREAM_MAIN_SHA=$UPSTREAM_SHA" >> $GITHUB_STEP_SUMMARY
+          echo "UPSTREAM_MAIN_SHA=$UPSTREAM_SHA"
 
           BEHIND=$(git rev-list --count HEAD..upstream/main)
-          echo "BEHIND_COUNT=$BEHIND" >> $GITHUB_STEP_SUMMARY
+          echo "BEHIND_COUNT=$BEHIND"
 
           if [ "$BEHIND" -eq 0 ]; then
-            echo "MERGE_ACTION=NO_ACTION" >> $GITHUB_STEP_SUMMARY
-            echo "status=NO_ACTION" >> $GITHUB_OUTPUT
-          else
-            if git merge upstream/main --ff-only; then
-              echo "MERGE_ACTION=FAST_FORWARD" >> $GITHUB_STEP_SUMMARY
-              echo "status=SYNCED" >> $GITHUB_OUTPUT
-              echo "Synced $BEHIND commits → $(git rev-parse --short HEAD)"
-            else
-              echo "MERGE_ACTION=FAILED" >> $GITHUB_STEP_SUMMARY
-              echo "FATAL: cannot fast-forward — fork main diverged from upstream"
-              exit 1
-            fi
+            echo "MERGE_ACTION=NO_ACTION"
+            echo "Already up to date."
+            exit 0
           fi
 
-      - name: Push to fork
-        if: steps.fetch.outputs.status == 'SYNCED'
-        id: push
-        run: |
-          echo "PUSH_ACTION=push origin main" >> $GITHUB_STEP_SUMMARY
-          git push origin main
+          git merge upstream/main --ff-only
+          echo "MERGE_ACTION=FAST_FORWARD"
+          echo "Synced $BEHIND commits"
 
-      - name: Verify exact mirror
-        if: steps.fetch.outputs.status == 'SYNCED'
-        run: |
+          git push origin main
+          echo "PUSH_ACTION=pushed"
+
           git fetch origin main
           ORIGIN_SHA=$(git rev-parse --short origin/main)
-          UPSTREAM_SHA=$(git rev-parse --short upstream/main)
-          echo "ORIGIN_MAIN_SHA_AFTER_PUSH=$ORIGIN_SHA" >> $GITHUB_STEP_SUMMARY
+          echo "ORIGIN_MAIN_SHA_AFTER_PUSH=$ORIGIN_SHA"
 
           if [ "$ORIGIN_SHA" = "$UPSTREAM_SHA" ]; then
-            echo "EXACT_MIRROR_STATUS=PASS" >> $GITHUB_STEP_SUMMARY
+            echo "EXACT_MIRROR_STATUS=PASS"
           else
-            echo "EXACT_MIRROR_STATUS=FAIL" >> $GITHUB_STEP_SUMMARY
+            echo "EXACT_MIRROR_STATUS=FAIL"
             echo "FATAL: origin/main ($ORIGIN_SHA) != upstream/main ($UPSTREAM_SHA)"
             exit 1
           fi
