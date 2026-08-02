@@ -17291,6 +17291,17 @@ def start_server(
             except Exception as exc:  # pragma: no cover - best-effort
                 _log.debug("loop noise filter install skipped: %s", exc)
 
+            # EGRESS OUTBOX WATCHER
+            try:
+                from outbox_watcher import install_outbox_watcher
+                _watcher = install_outbox_watcher(poll_interval=15)
+                _log.info("OutboxWatcher installed: poll_interval=15s")
+            except ImportError:
+                _log.debug("OutboxWatcher not available")
+            except Exception as exc:
+                _log.warning("OutboxWatcher install failed: %s", exc)
+
+
             # ── Loop heartbeat watchdog (CF-1) ───────────────────────────
             # Confirm the GIL-pressure hypothesis in production. Re-arm a 2s
             # tick and measure the drift between when it *should* fire and
