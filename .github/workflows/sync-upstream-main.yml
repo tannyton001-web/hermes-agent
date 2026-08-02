@@ -1,8 +1,12 @@
 name: Sync Fork Main with Upstream
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
+  # DISABLED (2026-08-02): desktop update detection no longer reads fork main —
+  # Electron checkUpdates() + banner.py compare against upstream/main directly.
+  # The auto-sync cron kept failing on GitHub's `workflows` permission gate
+  # whenever upstream touched .github/workflows/*, and it burned Actions quota.
+  # Sync manually when a fork mirror is needed:
+  #   git fetch upstream main && git push origin upstream/main:main
   workflow_dispatch:
 
 permissions:
