@@ -140,6 +140,12 @@ class OutboxWatcher:
         if WATCHER_STATE_FILE.exists():
             try:
                 data = json.loads(WATCHER_STATE_FILE.read_text())
+                # The constructor interval is authoritative — a stale state
+                # file (e.g. an earlier run with a different poll_interval)
+                # must not silently change the live polling cadence. Without
+                # this, a persisted 999s interval defeats install-time tuning
+                # and starves the outbox of polls.
+                data["poll_interval"] = self.poll_interval
                 return WatcherState(**data)
             except Exception:
                 pass
