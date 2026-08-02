@@ -205,7 +205,15 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
 
 
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
+    """Count commits behind origin/main (or upstream/main when present) in a local checkout.
+
+    Forks add an ``upstream`` remote pointing at NousResearch/hermes-agent;
+    counting against ``origin/main`` (the fork) reports stale numbers until
+    the fork is manually synced, and a dead fork-sync workflow silently hides
+    updates. Mirror ``_cmd_update_check``: prefer ``upstream/main`` as the
+    canonical reference when the remote exists, falling back to ``origin/main``
+    for non-fork installs.
+    """
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
     if _is_official_ssh_remote(origin_url):
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
@@ -213,6 +221,14 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         if checked == UPDATE_AVAILABLE_NO_COUNT:
             return 1
         return checked
+
+    # Forks carry an upstream remote; prefer it so the behind-count tracks the
+    # official repo directly instead of waiting for a fork sync.
+    has_upstream = (
+        _git_stdout(["remote", "get-url", "upstream"], cwd=repo_dir) is not None
+    )
+    compare_remote = "upstream" if has_upstream else "origin"
+    compare_branch = f"{compare_remote}/main"
 
     # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
     # clone the history stops at a single commit, so a plain `git fetch` would
@@ -234,7 +250,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # ref on a scoped fetch, so the ``HEAD..origin/main`` count below is
         # unaffected; the shallow path compares against FETCH_HEAD, which a
         # scoped fetch also updates.
-        fetch_args = ["git", "fetch", "origin", "main"]
+        fetch_args = ["git", "fetch", compare_remote, "main"]
         if is_shallow:
             fetch_args += ["--depth", "1"]
         fetch_args.append("--quiet")
@@ -253,7 +269,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         target_rev = (
             _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
+            or _git_stdout(["rev-parse", compare_branch], cwd=repo_dir)
         )
         if not head_rev or not target_rev:
             return None
@@ -261,7 +277,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
 
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{compare_branch}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=5,
             cwd=str(repo_dir),
