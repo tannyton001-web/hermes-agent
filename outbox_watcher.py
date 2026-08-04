@@ -215,6 +215,11 @@ class OutboxWatcher:
                     self._delivered_ids.add(envelope_id)
                     self._state.total_delivered += 1
                     self._state.last_delivery_at = utc_now()
+                    # Persist ACK to the envelope file so idempotency survives
+                    # a watcher restart — _delivered_ids is in-memory only and
+                    # resets on every serve restart, which re-delivered entries
+                    # that stayed COMMITTED (observed with stale TEST-20 spam).
+                    self._ack_envelope(envelope_id)
                 else:
                     self._state.total_failed += 1
             except Exception as e:
@@ -291,6 +296,32 @@ class OutboxWatcher:
         except Exception as e:
             logger.error(f"OutboxWatcher delivery error for {envelope_id}: {e}")
             return False
+
+    def _ack_envelope(self, envelope_id: str) -> bool:
+        """Persist a successful delivery by flipping the envelope to
+        USER_VISIBLE_ACKED on disk. In-memory _delivered_ids resets on serve
+        restart; without this the envelope stays COMMITTED and gets
+        re-delivered (observed with stale TEST-20 background_notify spam)."""
+        try:
+            for f in OUTBOX_DIR.glob("*.json"):
+                if f.name.endswith(".lock") or f.name.endswith(".tmp"):
+                    continue
+                try:
+                    data = json.loads(f.read_text())
+                except Exception:
+                    continue
+                env = data.get("envelope", {})
+                if env.get("envelope_id") == envelope_id and data.get("state") in PENDING_STATES:
+                    data["state"] = "USER_VISIBLE_ACKED"
+                    data["acked_at"] = utc_now()
+                    tmp = f.with_suffix(".json.tmp")
+                    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+                    tmp.rename(f)
+                    logger.info(f"OutboxWatcher ACKed envelope on disk: {envelope_id}")
+                    return True
+        except Exception as e:
+            logger.error(f"OutboxWatcher _ack_envelope failed for {envelope_id}: {e}")
+        return False
 
     def _resolve_adapter(self, platform: str) -> Any:
         """Resolve a real platform adapter or desktop delivery path.
