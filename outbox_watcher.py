@@ -37,6 +37,14 @@ DEFAULT_POLL_INTERVAL = 30  # seconds
 # ── Paths ────────────────────────────────────────────────────────────────────
 OUTBOX_DIR = Path.home() / ".hermes" / "egress" / "outbox"
 WATCHER_STATE_FILE = Path.home() / ".hermes" / "supervisor" / "watcher_state.json"
+# Single-instance lock: only ONE OutboxWatcher may poll the outbox at a time.
+# Hermes desktop restart spawns a NEW serve process without killing old ones,
+# so stale serve processes accumulate — each running its own watcher. Without
+# this lock, N watchers poll the same COMMITTED envelope in the same window
+# and N-deliver it (observed: CANARY-A delivered 10x by 11 concurrent
+# watchers). fcntl.flock is per-open-file-description, so a second process
+# opening the lock path fails LOCK_NB and exits cleanly.
+WATCHER_LOCK_FILE = Path.home() / ".hermes" / "egress" / ".watcher.lock"
 
 # ── Delivery states ─────────────────────────────────────────────────────────
 DELIVERY_COMMITTED = "COMMITTED"
@@ -158,13 +166,40 @@ class OutboxWatcher:
         tmp.rename(WATCHER_STATE_FILE)
 
     async def start(self) -> None:
-        """Start the background poll loop."""
+        """Start the background poll loop.
+
+        Enforces single-instance via an exclusive non-blocking flock on
+        WATCHER_LOCK_FILE. If another OutboxWatcher (from a stale serve
+        process) already holds the lock, this instance exits cleanly instead
+        of polling alongside it — N concurrent watchers would otherwise each
+        deliver the same COMMITTED envelope (observed duplicate: 10x).
+        """
         if self._running:
+            return
+        if not self._acquire_lock():
+            logger.warning(
+                "OutboxWatcher: another instance holds .watcher.lock — "
+                "skipping start to prevent duplicate delivery"
+            )
             return
         self._running = True
         self._state.active = True
         self._task = asyncio.create_task(self._poll_loop())
-        logger.info(f"OutboxWatcher started: poll_interval={self.poll_interval}s")
+        logger.info(f"OutboxWatcher started: poll_interval={self.poll_interval}s (lock held)")
+
+    def _acquire_lock(self) -> bool:
+        """Try to take the exclusive watcher lock (non-blocking)."""
+        try:
+            import fcntl
+            WATCHER_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self._lock_handle = open(WATCHER_LOCK_FILE, "w")
+            fcntl.flock(self._lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+        except Exception as e:  # noqa: BLE001 — lock failure must never crash serve
+            logger.warning(f"OutboxWatcher: lock acquire failed ({e}); starting anyway")
+            return True
 
     async def stop(self) -> None:
         """Stop the background poll loop."""
@@ -177,7 +212,23 @@ class OutboxWatcher:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        self._release_lock()
         logger.info("OutboxWatcher stopped")
+
+    def _release_lock(self) -> None:
+        """Release the single-instance lock (if held)."""
+        handle = getattr(self, "_lock_handle", None)
+        if handle is not None:
+            try:
+                import fcntl
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._lock_handle = None
 
     async def _poll_loop(self) -> None:
         """Main poll loop — runs forever while _running is True."""
