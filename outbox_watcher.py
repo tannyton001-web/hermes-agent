@@ -57,6 +57,20 @@ DELIVERY_FAILED = "FAILED"
 # States that need delivery
 PENDING_STATES = {DELIVERY_COMMITTED, "PENDING", "RETRY_WAIT", DELIVERY_FAILED}
 
+# Audit FINDING 4: a coordinator crash between `await adapter.send()` and the
+# PROVIDER_ACCEPTED write leaves the envelope stuck in CLAIMED/DISPATCHING —
+# not in PENDING_STATES, so the watcher never recovers it (message lost).
+# Reclaim those only after a lease age: if the entry is still mid-flight
+# (fresh timestamp), another writer owns it and we must NOT touch it.
+STUCK_STATES = {DELIVERY_CLAIMED, DELIVERY_DISPATCHING}
+STUCK_LEASE_SECONDS = 300  # 5 min — a normal emit completes in <1s
+
+# Audit FINDING 4: FAILED entries retried every 15s forever (no backoff, no
+# attempt cap, and write_entry resets attempts on merge). Cap attempts and
+# dead-letter the entry instead of hammering a permanently failing envelope.
+MAX_ATTEMPTS = 10
+DELIVERY_DEAD_LETTER = "DEAD_LETTER"
+
 # ── Data model ──────────────────────────────────────────────────────────────
 
 class DesktopCanaryAdapter:
@@ -280,7 +294,17 @@ class OutboxWatcher:
         self._save_state()
 
     def _find_pending_entries(self) -> list[dict]:
-        """Find outbox entries that need delivery."""
+        """Find outbox entries that need delivery.
+
+        Handles three delivery-relevant states:
+        - PENDING_STATES (COMMITTED/PENDING/RETRY_WAIT/FAILED): deliver now.
+        - STUCK_STATES (CLAIMED/DISPATCHING): reclaim only after the lease
+          expires — a fresh timestamp means another writer owns the emit.
+        - FAILED with attempts >= MAX_ATTEMPTS: dead-letter (audit FINDING 4:
+          previously retried every 15s forever with attempts reset by merge).
+        """
+        import time as _time
+        now = _time.time()
         results = []
         for f in sorted(OUTBOX_DIR.glob("*.json")):
             if f.name.endswith(".lock") or f.name.endswith(".tmp"):
@@ -289,10 +313,46 @@ class OutboxWatcher:
                 data = json.loads(f.read_text())
                 state = data.get("state", "")
                 if state in PENDING_STATES:
+                    attempts = int(data.get("attempts", 0) or 0)
+                    if state == DELIVERY_FAILED and attempts >= MAX_ATTEMPTS:
+                        # Dead-letter: permanently failing envelope — stop
+                        # hammering it every poll.
+                        self._dead_letter(f, data)
+                        continue
                     results.append(data)
+                elif state in STUCK_STATES:
+                    # Lease reclaim: only touch a stuck entry whose timestamp
+                    # is older than the lease window (crashed mid-emit).
+                    updated = data.get("updated_at", "") or data.get("created_at", "")
+                    if updated:
+                        try:
+                            from datetime import datetime as _dt
+                            from datetime import timezone as _tz
+                            ts = _dt.fromisoformat(updated)
+                            if ts.tzinfo is None:
+                                ts = ts.replace(tzinfo=_tz.utc)
+                            age = now - ts.timestamp()
+                            if age > STUCK_LEASE_SECONDS:
+                                logger.warning(f"OutboxWatcher: reclaiming stuck {state} envelope {f.stem} (age={age:.0f}s)")
+                                results.append(data)
+                        except Exception:
+                            pass
             except Exception:
                 pass
         return results
+
+    def _dead_letter(self, path, data) -> None:
+        """Mark a permanently failing envelope DEAD_LETTER (no more retries)."""
+        try:
+            data["state"] = DELIVERY_DEAD_LETTER
+            data["dead_lettered_at"] = utc_now()
+            data["dead_letter_reason"] = f"attempts={data.get('attempts', 0)} >= MAX_ATTEMPTS"
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+            tmp.rename(path)
+            logger.warning(f"OutboxWatcher: dead-lettered {path.stem} after {data.get('attempts', 0)} attempts")
+        except Exception as e:
+            logger.error(f"OutboxWatcher _dead_letter failed for {path.stem}: {e}")
 
     async def _deliver_entry(self, entry_data: dict) -> bool:
         """Deliver one outbox entry via EgressCoordinator with a real adapter."""
@@ -352,8 +412,14 @@ class OutboxWatcher:
         """Persist a successful delivery by flipping the envelope to
         USER_VISIBLE_ACKED on disk. In-memory _delivered_ids resets on serve
         restart; without this the envelope stays COMMITTED and gets
-        re-delivered (observed with stale TEST-20 background_notify spam)."""
+        re-delivered (observed with stale TEST-20 background_notify spam).
+
+        Uses the SAME per-envelope flock as OutboxStore (outbox.py) so the
+        read-modify-write can't lose the platform_result/message_id that the
+        coordinator wrote (audit FINDING 2: lost update when the watcher
+        overwrote a PROVIDER_ACCEPTED entry from a stale snapshot)."""
         try:
+            import fcntl
             for f in OUTBOX_DIR.glob("*.json"):
                 if f.name.endswith(".lock") or f.name.endswith(".tmp"):
                     continue
@@ -362,14 +428,34 @@ class OutboxWatcher:
                 except Exception:
                     continue
                 env = data.get("envelope", {})
-                if env.get("envelope_id") == envelope_id and data.get("state") in PENDING_STATES:
-                    data["state"] = "USER_VISIBLE_ACKED"
-                    data["acked_at"] = utc_now()
-                    tmp = f.with_suffix(".json.tmp")
-                    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str))
-                    tmp.rename(f)
-                    logger.info(f"OutboxWatcher ACKed envelope on disk: {envelope_id}")
-                    return True
+                if env.get("envelope_id") != envelope_id or data.get("state") not in PENDING_STATES:
+                    continue
+                # Per-envelope lock: serialize with OutboxStore writers.
+                lock_path = OUTBOX_DIR / f"{envelope_id}.lock"
+                try:
+                    with open(lock_path, "w") as lock_fh:
+                        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+                        try:
+                            # Re-read under lock — state may have advanced
+                            # (coordinator wrote PROVIDER_ACCEPTED + message_id).
+                            data = json.loads(f.read_text())
+                        except Exception:
+                            data = None
+                        if data and data.get("state") in PENDING_STATES:
+                            data["state"] = "USER_VISIBLE_ACKED"
+                            data["acked_at"] = utc_now()
+                            tmp = f.with_suffix(".json.tmp")
+                            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+                            tmp.rename(f)
+                            logger.info(f"OutboxWatcher ACKed envelope on disk: {envelope_id}")
+                            return True
+                        # state already terminal (another watcher won the race) —
+                        # treat as acked; the envelope is no longer pending.
+                        logger.info(f"OutboxWatcher: {envelope_id} already terminal, ack skipped")
+                        return True
+                except Exception as e:
+                    logger.error(f"OutboxWatcher _ack_envelope lock failed for {envelope_id}: {e}")
+                    return False
         except Exception as e:
             logger.error(f"OutboxWatcher _ack_envelope failed for {envelope_id}: {e}")
         return False
