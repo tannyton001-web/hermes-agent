@@ -102,24 +102,29 @@ class EgressCoordinator:
             return SendResult(success=False, envelope_id=envelope.envelope_id,
                             error="ADAPTER_NOT_IN_ALLOWLIST")
 
-        # 2. Idempotency check (check against terminal states)
-        if idempotent:
-            existing = self.outbox.find_by_idempotency_key(envelope.idempotency_key)
-            if existing and existing.state.is_terminal:
-                self._delivery_stats["duplicates"] += 1
-                logger.debug(f"Idempotent skip: {envelope.idempotency_key}")
-                return SendResult(
-                    success=True,
-                    envelope_id=envelope.envelope_id,
-                    message_id=existing.platform_result.get("message_id") if existing.platform_result else None,
-                    platform=target.platform,
-                )
-
-        # 3. Write to outbox — PREPARED → COMMITTED
+        # 2. Idempotency check + write — ATOMIC (audit #3: previously the
+        # unlocked find_by_idempotency_key() scan and write_entry() were two
+        # separate steps, so two concurrent emits with the same key both
+        # passed the check and both dispatched — reproduced 2x send).
         entry = OutboxEntry(envelope=envelope, state=DeliveryState.COMMITTED)
-        if not self.outbox.write_entry(entry):
-            return SendResult(success=False, envelope_id=envelope.envelope_id,
-                            error="OUTBOX_WRITE_FAILED")
+        if idempotent:
+            written, existing = self.outbox.write_entry_idempotent(entry)
+            if not written:
+                if existing is not None:
+                    self._delivery_stats["duplicates"] += 1
+                    logger.debug(f"Idempotent skip: {envelope.idempotency_key}")
+                    return SendResult(
+                        success=True,
+                        envelope_id=envelope.envelope_id,
+                        message_id=existing.platform_result.get("message_id") if existing.platform_result else None,
+                        platform=target.platform,
+                    )
+                return SendResult(success=False, envelope_id=envelope.envelope_id,
+                                error="OUTBOX_WRITE_FAILED")
+        else:
+            if not self.outbox.write_entry(entry):
+                return SendResult(success=False, envelope_id=envelope.envelope_id,
+                                error="OUTBOX_WRITE_FAILED")
 
         # 4. Claim and dispatch — COMMITTED → CLAIMED → DISPATCHING
         self.outbox.update_state(envelope.envelope_id, DeliveryState.CLAIMED)

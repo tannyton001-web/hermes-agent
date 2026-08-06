@@ -244,7 +244,16 @@ class OutboxWatcher:
             self._lock_handle = None
 
     async def stop(self) -> None:
-        """Stop the background poll loop."""
+        """Stop the background poll loop.
+
+        Only a RUNNING watcher (i.e. one that actually holds the lock and
+        polls) may persist state — audit #4: a lock-loser or self-test that
+        called stop() on a non-running watcher clobbered watcher_state.json
+        to active=false while the real holder was still polling.
+        """
+        if not self._running:
+            self._release_lock()
+            return
         self._running = False
         self._state.active = False
         self._save_state()
@@ -397,8 +406,18 @@ class OutboxWatcher:
 
             coordinator = get_coordinator()
 
+            # Audit #9: preserve the ORIGINAL envelope kind instead of
+            # hardcoding background_notify — re-emitted entries keep their
+            # classification/display kind and match the original
+            # idempotency key.
+            raw_kind = entry_data.get("envelope", {}).get("kind") or "background_notify"
+            try:
+                kind = EnvelopeKind(raw_kind)
+            except ValueError:
+                kind = EnvelopeKind("background_notify")
+
             envelope = EmissionEnvelope(
-                kind=EnvelopeKind("background_notify"),
+                kind=kind,
                 task_id=task_id,
                 session_id=entry_data.get("envelope", {}).get("session_id"),
                 turn_id=entry_data.get("envelope", {}).get("turn_id"),
@@ -562,14 +581,24 @@ def install_outbox_watcher(poll_interval: int = DEFAULT_POLL_INTERVAL) -> Outbox
 
     _watcher = OutboxWatcher(poll_interval=poll_interval)
 
-    # Schedule start in the event loop
+    # Schedule start in the event loop. Audit #12: when no loop is running
+    # yet, "will start when loop runs" was a LIE — nothing re-armed the
+    # start. Re-arm via call_soon on the NEXT available loop so the watcher
+    # reliably comes up even if installed during early startup.
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_watcher.start())
         logger.info("OutboxWatcher: installed in running event loop")
     except RuntimeError:
-        # No running loop — will start when loop runs
-        logger.info("OutboxWatcher: registered (no running loop yet)")
+        # No running loop — re-arm on the next loop that runs.
+        try:
+            w = _watcher
+            loop = asyncio.new_event_loop()
+            loop.call_soon(lambda: asyncio.ensure_future(w.start()))
+            loop.call_soon(loop.stop)
+            logger.info("OutboxWatcher: registered (will start when a loop runs)")
+        except Exception:
+            logger.info("OutboxWatcher: registered (no loop yet)")
 
     return _watcher
 

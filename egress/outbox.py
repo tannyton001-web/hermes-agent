@@ -128,10 +128,15 @@ class OutboxStore:
                         except (json.JSONDecodeError, KeyError):
                             pass
 
-                    # Merge or write new
-                    if existing and existing.state in (DeliveryState.PENDING, DeliveryState.RETRY_WAIT):
+                    # Merge or write new — KEEP attempts for ANY non-terminal
+                    # existing state (audit #2: FAILED entries were overwritten
+                    # by re-emits with attempts=0, so MAX_ATTEMPTS dead-letter
+                    # never fired and failing envelopes retried forever).
+                    if existing and not existing.state.is_terminal:
                         if existing.attempts > entry.attempts:
                             entry = existing
+                        elif existing.attempts > 0:
+                            entry.attempts = existing.attempts
 
                     entry.updated_at = datetime.now(timezone.utc).isoformat()
                     tmp_path = path.with_suffix(".tmp")
@@ -142,6 +147,46 @@ class OutboxStore:
                     fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
         except Exception:
             return False
+
+    def write_entry_idempotent(self, entry: OutboxEntry) -> tuple[bool, Optional[OutboxEntry]]:
+        """Atomically claim-and-write: check idempotency AND write under one
+        global lock — closes the TOCTOU window in coordinator.emit() where
+        find_by_idempotency_key() (unlocked scan) and write_entry() were two
+        separate steps: two concurrent emits with the same idempotency_key
+        both passed the check and both wrote (audit #3 — reproduced with
+        2x adapter.send() for one envelope).
+
+        Returns (True, None) when written; (False, existing) when a terminal
+        entry with the same idempotency_key already exists (skip dispatch).
+        """
+        global_lock = self.base_dir / ".dedup.lock"
+        try:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            with open(global_lock, "w") as glf:
+                fcntl.flock(glf.fileno(), fcntl.LOCK_EX)
+                try:
+                    key = entry.envelope.idempotency_key
+                    existing = self.find_by_idempotency_key(key)
+                    # Skip when:
+                    #   (a) existing is TERMINAL (any envelope_id) — the
+                    #       classic idempotent-skip path;
+                    #   (b) existing is IN-FLIGHT under a DIFFERENT
+                    #       envelope_id — audit #3 TOCTOU: a concurrent emit
+                    #       with the same key but a fresh envelope_id wrote a
+                    #       second file → duplicate dispatch.
+                    # Same envelope_id + non-terminal (watcher re-emit)
+                    # still merges via write_entry.
+                    if existing and (
+                        existing.state.is_terminal
+                        or existing.envelope.envelope_id != entry.envelope.envelope_id
+                    ):
+                        return False, existing
+                    ok = self.write_entry(entry)
+                    return (True, None) if ok else (False, None)
+                finally:
+                    fcntl.flock(glf.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            return False, None
 
     def read_entry(self, envelope_id: str) -> Optional[OutboxEntry]:
         """Read an outbox entry by envelope ID."""
