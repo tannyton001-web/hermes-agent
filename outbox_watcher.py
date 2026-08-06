@@ -34,6 +34,13 @@ logger = logging.getLogger("hermes.outbox_watcher")
 CONTRACT_VERSION = "OUTBOX_WATCHER_CONTRACT_V1"
 DEFAULT_POLL_INTERVAL = 30  # seconds
 
+# Standby retry cadence: when the single-instance lock is held at boot (e.g.
+# by a stale serve orphan), the watcher enters standby and retries every
+# LOCK_RETRY_SECONDS instead of skipping forever — so it takes over as soon
+# as the holder dies (watchdog kill). 5s is fast enough for canary E2E while
+# remaining cheap (2 log lines / retry, skipped work is nil).
+LOCK_RETRY_SECONDS = 5
+
 # ── Paths ────────────────────────────────────────────────────────────────────
 OUTBOX_DIR = Path.home() / ".hermes" / "egress" / "outbox"
 WATCHER_STATE_FILE = Path.home() / ".hermes" / "supervisor" / "watcher_state.json"
@@ -180,22 +187,31 @@ class OutboxWatcher:
         tmp.rename(WATCHER_STATE_FILE)
 
     async def start(self) -> None:
-        """Start the background poll loop.
+        """Start the background poll loop — active-standby single-instance.
 
         Enforces single-instance via an exclusive non-blocking flock on
         WATCHER_LOCK_FILE. If another OutboxWatcher (from a stale serve
-        process) already holds the lock, this instance exits cleanly instead
-        of polling alongside it — N concurrent watchers would otherwise each
-        deliver the same COMMITTED envelope (observed duplicate: 10x).
+        process) already holds the lock at boot, this instance DOES NOT skip
+        permanently — it enters standby and retries every
+        LOCK_RETRY_SECONDS until it can acquire (audit FINDING 8: a boot-time
+        skip left ZERO watchers polling when the holder was killed right
+        after: lock freed but nobody retried, so canaries stayed COMMITTED
+        forever). The first watcher to acquire polls; the rest wait in
+        standby and take over when the holder dies — exactly one active
+        watcher at any time, never zero.
         """
         if self._running:
             return
-        if not self._acquire_lock():
+        while not self._acquire_lock():
             logger.warning(
-                "OutboxWatcher: another instance holds .watcher.lock — "
-                "skipping start to prevent duplicate delivery"
+                "OutboxWatcher: .watcher.lock held by another process — "
+                f"standby, retry trong {LOCK_RETRY_SECONDS}s"
             )
-            return
+            self._close_lock_handle()  # fd leak guard (FINDING 8)
+            try:
+                await asyncio.sleep(LOCK_RETRY_SECONDS)
+            except asyncio.CancelledError:
+                raise
         self._running = True
         self._state.active = True
         self._task = asyncio.create_task(self._poll_loop())
@@ -214,6 +230,18 @@ class OutboxWatcher:
         except Exception as e:  # noqa: BLE001 — lock failure must never crash serve
             logger.warning(f"OutboxWatcher: lock acquire failed ({e}); starting anyway")
             return True
+
+    def _close_lock_handle(self) -> None:
+        """Close the lock fd if open — prevents fd leak on failed acquire
+        (FINDING 8: an unclosed fd made lsof report the serve as 'holding'
+        the lock while it was actually NOT flocking, confusing diagnosis)."""
+        handle = getattr(self, "_lock_handle", None)
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._lock_handle = None
 
     async def stop(self) -> None:
         """Stop the background poll loop."""
