@@ -104,6 +104,10 @@ class DesktopCanaryAdapter:
                 session_id=session_id,
                 content=content,
                 task_id=(metadata or {}).get("task_id", "outbox_watcher"),
+                # OPUS #5: pass the envelope idempotency key so crash-recovery
+                # re-delivery is deduped at the SQLite layer (side table),
+                # never duplicating a visible message.
+                dedup_key=(metadata or {}).get("egress_dedup"),
             )
             if result.get("persisted"):
                 return {"ok": True, "message_id": str(result.get("message_id"))}
@@ -298,8 +302,10 @@ class OutboxWatcher:
         self._state.total_polled += 1
         self._state.last_poll_at = utc_now()
 
-        # Find pending entries
-        pending = self._find_pending_entries()
+        # OPUS #1 (redefine): disk-scan + flock are blocking sync I/O — run
+        # them off the event loop via to_thread so a busy outbox (or a lock
+        # held by another process) never stalls the serve's WebSocket/HTTP.
+        pending = await asyncio.to_thread(self._find_pending_entries)
         if not pending:
             return
 
@@ -321,12 +327,34 @@ class OutboxWatcher:
                     # a watcher restart — _delivered_ids is in-memory only and
                     # resets on every serve restart, which re-delivered entries
                     # that stayed COMMITTED (observed with stale TEST-20 spam).
-                    self._ack_envelope(envelope_id)
+                    await asyncio.to_thread(self._ack_envelope, envelope_id)
                 else:
                     self._state.total_failed += 1
             except Exception as e:
                 logger.error(f"Failed to deliver {envelope_id}: {e}")
                 self._state.total_failed += 1
+
+        # OPUS #1: bounded outbox growth — prune terminal entries older than
+        # 24h every ~120 polls (30 min at poll_interval=15s) so the directory
+        # never balloons and glob-scans stay cheap.
+        self._poll_count = getattr(self, "_poll_count", 0) + 1
+        if self._poll_count % 120 == 0:
+            try:
+                from egress.outbox import OutboxStore
+                await asyncio.to_thread(self._cleanup_delivered)
+            except Exception as e:
+                logger.warning(f"OutboxWatcher cleanup skipped: {e}")
+
+    def _cleanup_delivered(self) -> None:
+        """Prune terminal outbox entries older than CLEANUP_AGE_HOURS."""
+        try:
+            from egress.outbox import OutboxStore
+            store = OutboxStore(base_dir=OUTBOX_DIR)
+            removed = store.cleanup_delivered(older_than_hours=24)
+            if removed:
+                logger.info(f"OutboxWatcher: cleaned {removed} delivered entries")
+        except Exception as e:
+            logger.warning(f"OutboxWatcher cleanup failed: {e}")
 
         self._save_state()
 
@@ -391,6 +419,36 @@ class OutboxWatcher:
         except Exception as e:
             logger.error(f"OutboxWatcher _dead_letter failed for {path.stem}: {e}")
 
+    def _fail_envelope(self, envelope_id: str, reason: str) -> None:
+        """Flip a pending envelope to FAILED and increment attempts — under
+        the per-envelope flock, mirroring _ack_envelope. OPUS #6: delivery
+        failures (e.g. no adapter for platform) must move the envelope out of
+        COMMITTED so attempts accumulate and dead-letter can eventually catch
+        it; otherwise it stays COMMITTED and retries forever."""
+        try:
+            import fcntl
+            f = OUTBOX_DIR / f"{envelope_id}.json"
+            if not f.exists():
+                return
+            lock_path = OUTBOX_DIR / f"{envelope_id}.lock"
+            with open(lock_path, "w") as lock_fh:
+                fcntl.flock(lock_fh, fcntl.LOCK_EX)
+                try:
+                    data = json.loads(f.read_text())
+                except Exception:
+                    data = None
+                if data and data.get("state") in PENDING_STATES:
+                    data["state"] = DELIVERY_FAILED
+                    data["attempts"] = int(data.get("attempts", 0) or 0) + 1
+                    data["last_error"] = reason
+                    data["updated_at"] = utc_now()
+                    tmp = f.with_suffix(".json.tmp")
+                    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+                    tmp.rename(f)
+                    logger.info(f"OutboxWatcher failed {envelope_id}: {reason} (attempt {data['attempts']})")
+        except Exception as e:
+            logger.error(f"OutboxWatcher _fail_envelope failed for {envelope_id}: {e}")
+
     async def _deliver_entry(self, entry_data: dict) -> bool:
         """Deliver one outbox entry via EgressCoordinator with a real adapter."""
         envelope_id = entry_data.get("envelope", {}).get("envelope_id", "unknown")
@@ -436,7 +494,12 @@ class OutboxWatcher:
             # Get a REAL adapter via factory — never pass None
             adapter = self._resolve_adapter(platform)
             if adapter is None:
-                logger.warning(f"OutboxWatcher: no adapter for platform={platform}, skipping {envelope_id}")
+                logger.warning(f"OutboxWatcher: no adapter for platform={platform}, failing {envelope_id}")
+                # OPUS #6: no-adapter must FAIL + increment attempts so the
+                # dead-letter path can catch it — previously it returned False
+                # without touching state, so the envelope stayed COMMITTED and
+                # was retried every 15s forever.
+                self._fail_envelope(envelope_id, f"NO_ADAPTER_FOR_PLATFORM:{platform}")
                 return False
 
             result = await coordinator.emit(envelope, target, adapter, idempotent=True)
@@ -590,15 +653,15 @@ def install_outbox_watcher(poll_interval: int = DEFAULT_POLL_INTERVAL) -> Outbox
         loop.create_task(_watcher.start())
         logger.info("OutboxWatcher: installed in running event loop")
     except RuntimeError:
-        # No running loop — re-arm on the next loop that runs.
-        try:
-            w = _watcher
-            loop = asyncio.new_event_loop()
-            loop.call_soon(lambda: asyncio.ensure_future(w.start()))
-            loop.call_soon(loop.stop)
-            logger.info("OutboxWatcher: registered (will start when a loop runs)")
-        except Exception:
-            logger.info("OutboxWatcher: registered (no loop yet)")
+        # OPUS #10: the previous "re-arm via new_event_loop" branch was a lie —
+        # a fresh loop was created but never run_forever(), so the task never
+        # executed and the loop leaked. Be honest: without a running loop we
+        # cannot start; web_server always calls this inside a running loop, so
+        # this branch is effectively unreachable in production.
+        logger.warning(
+            "OutboxWatcher: no running event loop — cannot start now; "
+            "install again from within a running loop"
+        )
 
     return _watcher
 

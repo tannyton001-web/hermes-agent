@@ -136,6 +136,11 @@ class EgressCoordinator:
             send_metadata = dict(target.metadata)
             if target.thread_id:
                 send_metadata["thread_id"] = target.thread_id
+            # OPUS #5: stamp the envelope idempotency key into send metadata so
+            # idempotent adapters (desktop_canary side table) can dedup
+            # crash-recovery re-delivery at the persistence layer.
+            if idempotent:
+                send_metadata["egress_dedup"] = envelope.idempotency_key
 
             platform_result = await adapter.send(target.chat_id, envelope.payload, metadata=send_metadata or None)
 
