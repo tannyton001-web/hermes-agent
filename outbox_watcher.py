@@ -306,6 +306,11 @@ class OutboxWatcher:
         # them off the event loop via to_thread so a busy outbox (or a lock
         # held by another process) never stalls the serve's WebSocket/HTTP.
         pending = await asyncio.to_thread(self._find_pending_entries)
+        # CRITICAL: always persist state, even with zero pending — otherwise
+        # last_poll_at freezes at the last non-empty poll, the watchdog sees
+        # a "stale lock holder" and kills the serve every 15 minutes
+        # (observed: 10 kill/respawn cycles, PID 62041→...→72206).
+        self._save_state()
         if not pending:
             return
 
